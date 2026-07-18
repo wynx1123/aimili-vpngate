@@ -88,6 +88,13 @@ fitness for a particular purpose. IP type, geolocation, and quality indicators
 are third-party signals and are not definitive proof of identity, legality, or
 risk.
 
+The management UI can load fonts, icons, and demonstration videos from remote
+content-delivery networks. A visitor's IP address, browser metadata, and
+referrer may therefore be disclosed to those providers. Review
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), confirm media rights, and
+self-host or remove external assets where privacy or licensing requirements
+demand it.
+
 ### License and commercial use
 
 This project remains under GNU GPL v3 or later. GPL permits copying,
