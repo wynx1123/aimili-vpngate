@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import base64
@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 import concurrent.futures
+import ipaddress
 import sys
 import uuid
 
@@ -77,6 +78,15 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+from config_cleanup import ConfigCleanupPolicy, cleanup_config_cache
+from tunnel_slots import TunnelHandle, TunnelSlots
+from vpn_sources import (
+    NodeFilters,
+    PublicVPNListClient,
+    SourceError,
+    apply_node_filters,
+    validate_openvpn_profile,
+)
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -112,6 +122,8 @@ MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
+BACKGROUND_TEST_NODE_LIMIT = env_int("BACKGROUND_TEST_NODE_LIMIT", 15, 1, 100)
+LATENCY_PROBE_WORKERS = env_int("LATENCY_PROBE_WORKERS", 10, 1, 50)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -120,21 +132,44 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
+PUBLICVPNLIST_PAGE_SIZE = env_int("PUBLICVPNLIST_PAGE_SIZE", 100, 1, 100)
+PUBLICVPNLIST_MAX_PAGES = env_int("PUBLICVPNLIST_MAX_PAGES", 20, 1, 100)
+PUBLICVPNLIST_METADATA_TTL = env_int("PUBLICVPNLIST_METADATA_TTL", 900, 0, 86400)
+TUNNEL_DRAIN_SECONDS = env_int("TUNNEL_DRAIN_SECONDS", 45, 0, 600)
+TUNNEL_DRAIN_MAX_SECONDS = env_int("TUNNEL_DRAIN_MAX_SECONDS", 180, 1, 1800)
+CONFIG_CLEANUP_INITIAL_DELAY_SECONDS = env_int("CONFIG_CLEANUP_INITIAL_DELAY_SECONDS", 60, 0, 3600)
+CONFIG_CLEANUP_INTERVAL_SECONDS = env_int("CONFIG_CLEANUP_INTERVAL_SECONDS", 3600, 60, 86400)
+CONFIG_MAX_FILES = env_int("CONFIG_MAX_FILES", 300, 10, 10000)
+CONFIG_MAX_AGE_SECONDS = env_int("CONFIG_MAX_AGE_SECONDS", 3 * 24 * 60 * 60, 300, 30 * 24 * 60 * 60)
+CONFIG_INVALID_GRACE_SECONDS = env_int("CONFIG_INVALID_GRACE_SECONDS", 30 * 60, 0, 7 * 24 * 60 * 60)
+CONFIG_ORPHAN_GRACE_SECONDS = env_int("CONFIG_ORPHAN_GRACE_SECONDS", 6 * 60 * 60, 0, 7 * 24 * 60 * 60)
+CONFIG_TEMP_MAX_AGE_SECONDS = env_int("CONFIG_TEMP_MAX_AGE_SECONDS", 60 * 60, 60, 24 * 60 * 60)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+WEBUI_DIR = ROOT_DIR / "webui"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+PUBLICVPNLIST_CACHE_FILE = DATA_DIR / "publicvpnlist_metadata_cache.json"
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
+config_cleanup_lock = threading.Lock()
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
+active_openvpn_interface = "tun0"
+tunnel_slots = TunnelSlots()
+publicvpnlist_client = PublicVPNListClient(
+    page_size=PUBLICVPNLIST_PAGE_SIZE,
+    max_pages=PUBLICVPNLIST_MAX_PAGES,
+    metadata_ttl=PUBLICVPNLIST_METADATA_TTL,
+    cache_path=PUBLICVPNLIST_CACHE_FILE,
+)
 is_connecting = False
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -172,8 +207,28 @@ def upstream_proxy_auth_file() -> str | None:
 
 def write_json(path: Path, data: Any) -> None:
     with lock:
+        serialized_data = data
+        compact = False
+        if path == globals().get("NODES_FILE") and isinstance(data, list):
+            serialized_data = []
+            for item in data:
+                if isinstance(item, dict):
+                    stripped = item.copy()
+                    stripped.pop("config_text", None)
+                    serialized_data.append(stripped)
+                else:
+                    serialized_data.append(item)
+            compact = True
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(
+                serialized_data,
+                ensure_ascii=False,
+                indent=None if compact else 2,
+                separators=(",", ":") if compact else None,
+            ),
+            encoding="utf-8",
+        )
         tmp.replace(path)
 
 def read_json(path: Path, default: Any) -> Any:
@@ -227,7 +282,16 @@ def load_ui_config() -> dict[str, Any]:
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
-            "fav_fail_fallback": False
+            "fav_fail_fallback": False,
+            "node_source": os.environ.get("NODE_SOURCE", "vpngate"),
+            "filter_country": "",
+            "filter_source": "",
+            "filter_protocol": "",
+            "min_speed_mbps": 0,
+            "max_latency_ms": 0,
+            "ip_purity": "any",
+            "only_verified": False,
+            "only_downloadable": True,
         }
         updated = False
         if auth_file.exists():
@@ -235,7 +299,14 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"]:
+                for key in [
+                    "host", "port", "proxy_port", "routing_mode", "force_country",
+                    "routing_ip_type", "connection_enabled", "fixed_node_id",
+                    "favorite_node_ids", "fav_fail_fallback", "node_source",
+                    "filter_country", "filter_source", "filter_protocol",
+                    "min_speed_mbps", "max_latency_ms", "ip_purity",
+                    "only_verified", "only_downloadable",
+                ]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -263,6 +334,15 @@ def load_ui_config() -> dict[str, Any]:
         if normalized_proxy_port != config.get("proxy_port"):
             config["proxy_port"] = normalized_proxy_port
             updated = True
+
+        try:
+            normalized_filters = NodeFilters.from_mapping(config).to_dict()
+        except ValueError:
+            normalized_filters = NodeFilters().to_dict()
+        for key, value in normalized_filters.items():
+            if config.get(key) != value:
+                config[key] = value
+                updated = True
             
         if not auth_file.exists() or updated:
             try:
@@ -350,10 +430,11 @@ def read_nodes() -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 def get_state() -> dict[str, Any]:
-    global active_openvpn_node_id, is_connecting
+    global active_openvpn_node_id, active_openvpn_interface, is_connecting
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["active_openvpn_interface"] = active_openvpn_interface
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
     state.setdefault("api_url", API_URL)
@@ -380,6 +461,9 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = False
+    state["node_filters"] = NodeFilters.from_mapping(ui_cfg).to_dict()
+    state["tunnels"] = tunnel_slots.snapshot()
+    state["proxy_egress"] = proxy_server.get_egress_snapshot()
     
     return state
 
@@ -389,9 +473,7 @@ def safe_name(value: str) -> str:
 
 def clear_active_connection_state(message: str) -> None:
     global active_openvpn_process, active_openvpn_node_id
-    stop_process(active_openvpn_process)
-    active_openvpn_process = None
-    active_openvpn_node_id = ""
+    stop_active_openvpn()
     with lock:
         nodes = read_nodes()
         for item in nodes:
@@ -710,15 +792,22 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
     
     country_long = row.get("CountryLong", "")
     country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, vpn_utils.COUNTRY_TRANSLATIONS.get(country_long.strip(), country_long))
+    speed_bps = parse_int(row.get("Speed"))
+    reported_latency = parse_int(row.get("Ping"))
     return {
         "id": node_id,
+        "catalog_source": "vpngate",
+        "source": "VPNGate",
+        "protocol": "openvpn",
         "country": country_zh,
         "country_short": country_short,
         "host_name": row.get("HostName", ""),
         "ip": ip,
         "score": parse_int(row.get("Score")),
-        "ping": parse_int(row.get("Ping")),
-        "speed": parse_int(row.get("Speed")),
+        "ping": reported_latency,
+        "speed": speed_bps,
+        "speed_mbps": round(speed_bps / 1_000_000, 3),
+        "reported_latency_ms": reported_latency,
         "sessions": parse_int(row.get("NumVpnSessions")),
         "owner": "",
         "asn": "",
@@ -729,6 +818,8 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "latency_ms": 0,
         "config_file": str(config_path),
         "config_text": config_text,
+        "downloadable": True,
+        "verified": False,
         "proto": proto,
         "remote_host": remote_host,
         "remote_port": remote_port,
@@ -738,7 +829,8 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "probed_at": 0,
     }
 
-def fetch_candidates() -> list[dict[str, Any]]:
+def fetch_vpngate_candidates(filters: NodeFilters | None = None) -> list[dict[str, Any]]:
+    filters = filters or NodeFilters()
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
@@ -811,6 +903,11 @@ def fetch_candidates() -> list[dict[str, Any]]:
         else:
             raise RuntimeError(diag_msg)
                 
+    candidates = apply_node_filters(candidates, filters, include_ip_purity=False)
+    if filters.ip_purity != "any" and candidates:
+        vpn_utils.enrich_ip_info(candidates)
+        candidates = apply_node_filters(candidates, filters, include_ip_purity=True)
+
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
@@ -820,8 +917,151 @@ def fetch_candidates() -> list[dict[str, Any]]:
     log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
     return candidates
 
+
+def fetch_publicvpnlist_candidates(filters: NodeFilters, force_refresh: bool = False) -> list[dict[str, Any]]:
+    log_to_json("INFO", "Source", "开始拉取 PublicVPNList 节点元数据")
+    candidates = publicvpnlist_client.fetch_candidates(
+        filters,
+        max_candidates=MAX_SCAN_ROWS,
+        force_refresh=force_refresh,
+    )
+    blacklist = load_blacklist()
+    filtered: list[dict[str, Any]] = []
+    for node in candidates:
+        node_id = str(node.get("id") or "")
+        entry = blacklist.get(node_id)
+        if entry and float(entry.get("until", 0) or 0) > time.time():
+            continue
+        node["config_file"] = str(CONFIG_DIR / f"{safe_name(node_id)}.ovpn")
+        filtered.append(node)
+
+    if filters.ip_purity != "any" and filtered:
+        vpn_utils.enrich_ip_info(filtered)
+        filtered = apply_node_filters(filtered, filters, include_ip_purity=True)
+    log_to_json("INFO", "Source", f"PublicVPNList 元数据筛选完成，候选节点 {len(filtered)} 个")
+    return filtered
+
+
+def fetch_candidates(force_refresh: bool = False) -> list[dict[str, Any]]:
+    filters = NodeFilters.from_mapping(load_ui_config())
+    candidates: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    if filters.node_source in {"vpngate", "all"}:
+        try:
+            candidates.extend(fetch_vpngate_candidates(filters))
+        except Exception as exc:
+            errors.append(f"VPNGate: {exc}")
+            if filters.node_source == "vpngate":
+                raise
+
+    if filters.node_source in {"publicvpnlist", "all"}:
+        try:
+            candidates.extend(fetch_publicvpnlist_candidates(filters, force_refresh=force_refresh))
+        except Exception as exc:
+            errors.append(f"PublicVPNList: {exc}")
+            log_to_json("ERROR", "Source", f"PublicVPNList 获取失败: {exc}")
+            if filters.node_source == "publicvpnlist":
+                raise
+
+    unique: dict[str, dict[str, Any]] = {}
+    for node in candidates:
+        node_id = str(node.get("id") or "")
+        if node_id:
+            unique[node_id] = node
+    result = list(unique.values())
+    if not result:
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        set_state(
+            last_fetch_at=time.time(),
+            last_fetch_status="ok",
+            last_fetch_message=f"来源 {filters.node_source} 可访问，但当前筛选条件没有匹配节点",
+            active_node_source=filters.node_source,
+        )
+        return []
+
+    set_state(
+        last_fetch_at=time.time(),
+        last_fetch_status="ok",
+        last_fetch_message=f"从 {filters.node_source} 获取并筛选出 {len(result)} 个候选节点",
+        active_node_source=filters.node_source,
+    )
+    return result
+
 def cached_nodes() -> list[dict[str, Any]]:
     return read_nodes()
+
+
+_node_config_locks_guard = threading.Lock()
+_node_config_locks: dict[str, threading.Lock] = {}
+
+
+def ensure_node_config(node: dict[str, Any]) -> dict[str, Any]:
+    node_id = str(node.get("id") or "").strip()
+    if not node_id:
+        raise RuntimeError("节点缺少 ID")
+    protocol = str(node.get("protocol") or "openvpn").lower()
+    if protocol != "openvpn":
+        raise RuntimeError(f"节点 {node_id} 需要尚未注册的协议驱动: {protocol}")
+    with _node_config_locks_guard:
+        node_lock = _node_config_locks.setdefault(node_id, threading.Lock())
+    with node_lock:
+        return _ensure_node_config_unlocked(node)
+
+
+def _ensure_node_config_unlocked(node: dict[str, Any]) -> dict[str, Any]:
+    """Materialize a lazy node profile without exposing its short-lived token."""
+    node_id = str(node.get("id") or "").strip()
+    if not node_id:
+        raise RuntimeError("节点缺少 ID")
+    config_path = Path(node.get("config_file") or (CONFIG_DIR / f"{safe_name(node_id)}.ovpn"))
+    config_text = str(node.get("config_text") or "")
+    if not config_text and config_path.exists():
+        try:
+            config_text = config_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            config_text = ""
+
+    if not config_text:
+        if node.get("catalog_source") != "publicvpnlist":
+            raise RuntimeError(f"节点 {node_id} 没有可用的 OpenVPN 配置")
+        try:
+            legacy_id = int(node.get("legacy_id") or 0)
+            config_text = publicvpnlist_client.download_openvpn_config(legacy_id)
+        except (ValueError, SourceError) as exc:
+            raise RuntimeError(f"PublicVPNList 节点配置下载失败: {exc}") from exc
+
+    if node.get("catalog_source") == "publicvpnlist":
+        validate_openvpn_profile(config_text)
+
+    CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+    config_path.write_text(config_text, encoding="utf-8")
+    try:
+        config_path.chmod(0o600)
+    except OSError:
+        pass
+
+    updated = dict(node)
+    updated["config_file"] = str(config_path)
+    updated["config_text"] = config_text
+    updated["config_cached_at"] = time.time()
+    remote_host, remote_port, proto = vpn_utils.parse_remote(config_text, str(node.get("ip") or ""))
+    if remote_host:
+        updated["remote_host"] = remote_host
+    if remote_port:
+        updated["remote_port"] = remote_port
+    if proto:
+        updated["proto"] = proto
+
+    with lock:
+        nodes = read_nodes()
+        for index, current in enumerate(nodes):
+            if current.get("id") == node_id:
+                nodes[index] = updated
+                break
+        write_json(NODES_FILE, nodes)
+    return updated
 
 _openvpn_version = None
 
@@ -1086,21 +1326,22 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> None:
+def setup_policy_routing(interface: str = "tun0", route_table: int | None = None) -> None:
+    route_table = route_table or tunnel_slots.table_for(interface)
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "rule", "del", "oif", interface, "table", str(route_table)], capture_output=True, timeout=2)
     except Exception:
         pass
     try:
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", str(route_table)], capture_output=True, timeout=2)
     except Exception:
         pass
     
     success = False
     for attempt in range(1, 4):
         try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", str(route_table)], check=True, timeout=2)
+            subprocess.run(["ip", "rule", "add", "oif", interface, "table", str(route_table)], check=True, timeout=2)
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
                 try:
@@ -1118,37 +1359,44 @@ def setup_policy_routing(interface: str = "tun0") -> None:
         print("[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
         log_to_json("ERROR", "Routing", "[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由")
 
-def cleanup_policy_routing() -> None:
-    try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-        print("[policy_routing] Cleared policy routing table 100", flush=True)
-    except Exception:
-        pass
+def cleanup_policy_routing(interface: str | None = None, route_table: int | None = None) -> None:
+    interfaces = [interface] if interface else list(tunnel_slots.interfaces)
+    for current_interface in interfaces:
+        current_table = route_table or tunnel_slots.table_for(current_interface)
+        try:
+            subprocess.run(
+                ["ip", "rule", "del", "oif", current_interface, "table", str(current_table)],
+                capture_output=True,
+                timeout=2,
+            )
+            subprocess.run(["ip", "route", "flush", "table", str(current_table)], capture_output=True, timeout=2)
+            print(f"[policy_routing] Cleared {current_interface} table {current_table}", flush=True)
+        except Exception:
+            pass
 
 def stop_active_openvpn() -> None:
-    global active_openvpn_process, active_openvpn_node_id
+    global active_openvpn_process, active_openvpn_node_id, active_openvpn_interface
     with lock:
-        cleanup_policy_routing()
-        config_to_delete = None
-        if active_openvpn_node_id:
-            nodes = read_nodes()
-            node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
-            if node:
-                config_to_delete = node.get("config_file")
-                
-        stop_process(active_openvpn_process)
+        handles = tunnel_slots.clear()
+        tracked_processes = {id(handle.process) for handle in handles if handle.process is not None}
+        if active_openvpn_process is not None and id(active_openvpn_process) not in tracked_processes:
+            handles.append(
+                TunnelHandle(
+                    node_id=active_openvpn_node_id,
+                    interface=active_openvpn_interface,
+                    route_table=tunnel_slots.table_for(active_openvpn_interface),
+                    process=active_openvpn_process,
+                    config_file="",
+                )
+            )
         active_openvpn_process = None
         active_openvpn_node_id = ""
-        kill_existing_openvpn_processes()
-        
-        if config_to_delete:
-            try:
-                path = Path(config_to_delete)
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
+        active_openvpn_interface = "tun0"
+        proxy_server.set_active_interface("tun0")
+
+    for handle in handles:
+        cleanup_policy_routing(handle.interface, handle.route_table)
+        stop_process(handle.process)
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -1214,7 +1462,12 @@ def country_matches(node_country: Any, target_country: Any) -> bool:
     return bool(target_country) and normalized_country_name(node_country) == normalized_country_name(target_country)
 
 def probe_priority_key(node: dict[str, Any]) -> tuple[int, int, int, int]:
-    ping = parse_int(node.get("ping")) or 999999
+    ping = (
+        parse_int(node.get("reported_latency_ms"))
+        or parse_int(node.get("latency_ms"))
+        or parse_int(node.get("ping"))
+        or 999999
+    )
     return (
         ping,
         -parse_int(node.get("score")),
@@ -1331,16 +1584,65 @@ def test_config_path(node_id: str) -> Path:
     safe_id = safe_name(node_id)
     return CONFIG_DIR / f".test_{safe_id}_{uuid.uuid4().hex}.ovpn"
 
+
+def measure_node_latencies(node_ids: list[str]) -> list[dict[str, Any]]:
+    wanted = {str(node_id or "").strip() for node_id in node_ids if str(node_id or "").strip()}
+    nodes = read_nodes()
+    targets = [node for node in nodes if node.get("id") in wanted]
+
+    def measure(node: dict[str, Any]) -> dict[str, Any]:
+        host = str(node.get("remote_host") or node.get("ip") or "")
+        port = parse_int(node.get("remote_port"))
+        reported = (
+            parse_int(node.get("reported_latency_ms"))
+            or parse_int(node.get("ping"))
+        )
+        if not host or port <= 0:
+            latency = reported
+            source = "metadata" if reported > 0 else "unavailable"
+        elif str(node.get("proto") or "").lower() == "tcp":
+            latency = vpn_utils.tcp_latency_ms(host, port, vpn_utils.get_physical_interface())
+            source = "tcp_connect" if latency > 0 else "metadata"
+            if latency <= 0:
+                latency = reported
+        else:
+            latency = vpn_utils.ping_latency_ms(host, port, reported)
+            source = "icmp_or_metadata" if latency > 0 else "unavailable"
+        return {
+            "id": node.get("id"),
+            "latency_ms": latency,
+            "latency_source": source,
+            "latency_checked_at": time.time(),
+        }
+
+    results: list[dict[str, Any]] = []
+    workers = min(LATENCY_PROBE_WORKERS, max(1, len(targets)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(measure, node) for node in targets]
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+
+    by_id = {result["id"]: result for result in results}
+    with lock:
+        current_nodes = read_nodes()
+        for node in current_nodes:
+            result = by_id.get(node.get("id"))
+            if result:
+                node.update(result)
+        write_json(NODES_FILE, sort_all_nodes(current_nodes))
+    return results
+
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
-        config_text = node.get("config_text") or ""
-        h = str(node.get("remote_host") or node.get("ip"))
-        p = parse_int(node.get("remote_port"))
-        fallback_ping = parse_int(node.get("ping"))
+    node = ensure_node_config(node)
+    config_text = node.get("config_text") or ""
+    h = str(node.get("remote_host") or node.get("ip"))
+    p = parse_int(node.get("remote_port"))
+    fallback_ping = parse_int(node.get("ping"))
 
     temp_path = test_config_path(node_id)
     try:
@@ -1417,6 +1719,16 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
         node_id = n_info["id"]
+        try:
+            n_info = ensure_node_config(n_info)
+        except Exception as exc:
+            return {
+                "id": node_id,
+                "latency_ms": 0,
+                "probe_status": "unavailable",
+                "probe_message": str(exc),
+                "probed_at": time.time(),
+            }
         config_text = n_info.get("config_text") or ""
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
@@ -1490,14 +1802,6 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
-            with lock:
-                current_nodes = read_nodes()
-                for n in current_nodes:
-                    if n.get("id") == nid:
-                        n.update(updated_nodes_map[nid])
-                        break
-                write_json(NODES_FILE, sort_all_nodes(current_nodes))
-                
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
     successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
     if successful_nodes:
@@ -1584,14 +1888,100 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
-def connect_node(node_id: str) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting
+def check_tunnel_health(interface: str) -> dict[str, Any]:
+    def check_url(url: str) -> dict[str, Any] | None:
+        cmd = [
+            "curl", "-sS", "-w", "\n%{time_total} %{http_code}",
+            "--interface", interface, "--max-time", "5", url,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+            if result.returncode != 0:
+                return None
+            lines = result.stdout.strip().splitlines()
+            if len(lines) < 2:
+                return None
+            timing = lines[-1].split()
+            ip = lines[-2].strip()
+            if len(timing) != 2 or timing[1] != "200" or not ip:
+                return None
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                return None
+            return {"ok": True, "ip": ip, "latency_ms": int(float(timing[0]) * 1000)}
+        except Exception:
+            return None
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    futures = [
+        executor.submit(check_url, "http://ip.sb"),
+        executor.submit(check_url, "http://api.ipify.org"),
+    ]
+    try:
+        for future in concurrent.futures.as_completed(futures, timeout=7):
+            result = future.result()
+            if result:
+                for pending in futures:
+                    pending.cancel()
+                return result
+    except Exception:
+        pass
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return {"ok": False, "error": f"新隧道 {interface} 已建立，但出口联通性验证失败"}
+
+
+def _stop_tunnel_handle(handle: TunnelHandle, *, cleanup_route: bool = True) -> None:
+    if cleanup_route:
+        cleanup_policy_routing(handle.interface, handle.route_table)
+    stop_process(handle.process)
+
+
+def _free_candidate_slot(interface: str) -> None:
+    for handle in tunnel_slots.draining(interface):
+        released = tunnel_slots.release_draining(interface)
+        if released is handle:
+            _stop_tunnel_handle(handle)
+
+
+def _drain_old_tunnel(handle: TunnelHandle) -> None:
+    started = time.time()
+    soft_deadline = started + TUNNEL_DRAIN_SECONDS
+    hard_deadline = started + max(TUNNEL_DRAIN_SECONDS, TUNNEL_DRAIN_MAX_SECONDS)
+    while time.time() < hard_deadline:
+        connections = proxy_server.get_interface_connection_count(handle.interface)
+        if connections <= 0:
+            break
+        if time.time() >= soft_deadline:
+            set_state(
+                last_check_message=(
+                    f"新出口已启用；旧接口 {handle.interface} 仍有 {connections} 个连接，正在排空"
+                )
+            )
+        time.sleep(1)
+
+    released = tunnel_slots.release_draining(handle.interface)
+    if released is handle:
+        remaining = proxy_server.get_interface_connection_count(handle.interface)
+        _stop_tunnel_handle(handle)
+        log_to_json(
+            "INFO",
+            "VPN",
+            f"旧隧道 {handle.interface} 已排空并关闭，关闭时剩余连接 {remaining}",
+        )
+    else:
+        stop_process(handle.process)
+
+
+def connect_node(node_id: str, *, reserved: bool = False) -> str:
+    global active_openvpn_process, active_openvpn_node_id, active_openvpn_interface, is_connecting
+    global last_active_ping_time, last_active_latency
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Node id is required")
-    stopped_existing = False
     with lock:
-        if is_connecting:
+        if is_connecting and not reserved:
             print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
             raise RuntimeError("当前已有连接或节点检测任务正在运行，请稍后再试")
         is_connecting = True
@@ -1604,6 +1994,8 @@ def connect_node(node_id: str) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
+        node = ensure_node_config(node)
+        nodes = read_nodes()
         
         ui_cfg = load_ui_config()
         validate_node_allowed_by_routing(node, ui_cfg)
@@ -1615,10 +2007,6 @@ def connect_node(node_id: str) -> str:
             DATA_DIR.mkdir(exist_ok=True, parents=True)
             write_json(auth_file, ui_cfg)
         
-        set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
-        stop_active_openvpn()
-        stopped_existing = True
-
         set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
         config_path = Path(node["config_file"])
         try:
@@ -1627,47 +2015,68 @@ def connect_node(node_id: str) -> str:
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
-        set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
-        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
+        candidate_interface = tunnel_slots.candidate_interface()
+        _free_candidate_slot(candidate_interface)
+        candidate_table = tunnel_slots.table_for(candidate_interface)
+
+        set_state(
+            active_node_latency="启动核心",
+            last_check_message=f"正在通过 {candidate_interface} 建立候选 OpenVPN 隧道，当前出口保持服务...",
+        )
+        ok, message, process = run_openvpn_until_ready(
+            str(node["config_file"]),
+            keep_alive=True,
+            route_nopull=True,
+            dev=candidate_interface,
+        )
         if not ok or process is None:
-            try:
-                if config_path.exists():
-                    config_path.unlink()
-            except Exception:
-                pass
             node["probe_status"] = "unavailable"
             node["probe_message"] = message
             for item in nodes:
-                item["active"] = False
+                if item.get("id") == node_id:
+                    item.update(node)
             write_json(NODES_FILE, nodes)
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
-            set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
-            with lock:
-                active_openvpn_node_id = ""
+            set_state(is_connecting=False, last_check_message=f"候选节点连接失败，当前出口未中断: {message}")
             raise RuntimeError(message)
-            
+
+        candidate = TunnelHandle(
+            node_id=node_id,
+            interface=candidate_interface,
+            route_table=candidate_table,
+            process=process,
+            config_file=str(config_path),
+        )
+        try:
+            set_state(active_node_latency="配置路由", last_check_message=f"正在配置候选出口 {candidate_interface}...")
+            setup_policy_routing(candidate_interface, candidate_table)
+            set_state(active_node_latency="验证出口", last_check_message="正在验证候选隧道，当前出口继续承载连接...")
+            health = check_tunnel_health(candidate_interface)
+            if not health.get("ok"):
+                raise RuntimeError(str(health.get("error") or "候选隧道出口验证失败"))
+        except Exception as exc:
+            _stop_tunnel_handle(candidate)
+            with lock:
+                failed_nodes = read_nodes()
+                for item in failed_nodes:
+                    if item.get("id") == node_id:
+                        item["probe_status"] = "unavailable"
+                        item["probe_message"] = str(exc)
+                        item["probed_at"] = time.time()
+                        break
+                write_json(NODES_FILE, failed_nodes)
+            raise
+
+        previous = tunnel_slots.activate(candidate)
+        proxy_server.set_active_interface(candidate_interface)
         with lock:
             active_openvpn_process = process
             active_openvpn_node_id = node_id
-        
-        set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
-        setup_policy_routing("tun0")
-        
-        global last_active_ping_time, last_active_latency
+            active_openvpn_interface = candidate_interface
+
         last_active_ping_time = time.time()
-        last_active_latency = 0
-        
-        set_state(active_node_latency="测试延迟", last_check_message="正在直连测试代理出口延迟与可用性...")
-        try:
-            ip = node.get("ip") or node.get("remote_host")
-            port = parse_int(node.get("remote_port"))
-            fallback = parse_int(node.get("ping"))
-            latency = vpn_utils.ping_latency_ms(ip, port, fallback)
-            if latency > 0:
-                last_active_latency = latency
-        except Exception:
-            pass
+        last_active_latency = parse_int(health.get("latency_ms"))
             
         for item in nodes:
             item["active"] = item.get("id") == node_id
@@ -1676,36 +2085,73 @@ def connect_node(node_id: str) -> str:
                 item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
         write_json(NODES_FILE, nodes)
         
-        set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
-        res = check_proxy_health()
-        if res["ok"]:
-            set_state(
-                proxy_ok=True,
-                proxy_ip=res["ip"],
-                proxy_latency_ms=res["latency_ms"],
-                proxy_error=""
-            )
-        else:
-            set_state(
-                proxy_ok=False,
-                proxy_ip="-",
-                proxy_latency_ms=0,
-                proxy_error=res.get("error", "未知错误")
-            )
-            
+        set_state(
+            proxy_ok=True,
+            proxy_ip=health.get("ip", "-"),
+            proxy_latency_ms=last_active_latency,
+            proxy_error="",
+        )
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
-        set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
-        log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+        switch_message = f"Connected {node_id} via {candidate_interface}"
+        if previous is not None:
+            switch_message += f"；旧出口 {previous.interface} 正在排空"
+            threading.Thread(target=_drain_old_tunnel, args=(previous,), daemon=True).start()
+        set_state(
+            active_openvpn_node_id=node_id,
+            active_openvpn_interface=candidate_interface,
+            is_connecting=False,
+            last_check_message=switch_message,
+            active_node_latency=latency_str,
+        )
+        log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口已原子切换到 {candidate_interface}")
         return f"Connected {node_id}"
     except Exception as exc:
-        if stopped_existing or (active_openvpn_node_id == node_id and not active_openvpn_running()):
-            clear_active_connection_state(f"连接失败: {exc}")
-        else:
+        current_active = tunnel_slots.active()
+        if current_active is None or not current_active.running():
             set_state(is_connecting=False, last_check_message=f"连接失败: {exc}")
+        else:
+            set_state(is_connecting=False, last_check_message=f"切换失败，继续使用 {current_active.node_id}: {exc}")
         raise
     finally:
         with lock:
             is_connecting = False
+
+
+def queue_connect_node(node_id: str) -> str:
+    global is_connecting
+    node_id = str(node_id or "").strip()
+    if not node_id:
+        raise ValueError("Node id is required")
+    job_id = uuid.uuid4().hex
+    with lock:
+        if is_connecting or maintenance_lock.locked():
+            raise RuntimeError("当前已有连接或节点维护任务正在运行，请稍后再试")
+        if not any(node.get("id") == node_id for node in read_nodes()):
+            raise ValueError(f"Node not found: {node_id}")
+        is_connecting = True
+        set_state(
+            is_connecting=True,
+            connect_job_id=job_id,
+            connect_job_status="queued",
+            last_check_message=f"切换任务已进入后台队列: {node_id}",
+        )
+
+    def worker() -> None:
+        try:
+            set_state(connect_job_id=job_id, connect_job_status="running")
+            connect_node(node_id, reserved=True)
+            set_state(connect_job_id=job_id, connect_job_status="completed")
+        except Exception as exc:
+            log_to_json("ERROR", "VPN", f"后台切换任务 {job_id} 失败: {exc}")
+            set_state(connect_job_id=job_id, connect_job_status="failed", connect_job_error=str(exc))
+
+    try:
+        threading.Thread(target=worker, daemon=True, name=f"vpn-connect-{job_id[:8]}").start()
+    except Exception:
+        with lock:
+            is_connecting = False
+        raise
+    return job_id
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -1722,11 +2168,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
             return msg
         is_connecting = True
     try:
-        if force:
-            with lock:
-                stop_active_openvpn()
-            reconnect_fixed_node_if_needed(load_ui_config())
-        elif not active_openvpn_running():
+        if not active_openvpn_running():
             ui_cfg = load_ui_config()
             routing_mode = ui_cfg.get("routing_mode", "auto")
             connection_enabled = ui_cfg.get("connection_enabled", True)
@@ -1747,18 +2189,27 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
-            candidates = fetch_candidates()
+            candidates = fetch_candidates(force_refresh=force)
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
-            if not any(token in diag_msg for token in ["[ERR_", "错误代码"]):
+            selected_source = NodeFilters.from_mapping(load_ui_config()).node_source
+            if selected_source in {"vpngate", "all"} and not any(token in diag_msg for token in ["[ERR_", "错误代码"]):
                 err_code, raw_diag = vpn_utils.diagnose_api_failure(API_URL)
                 diag_msg = f"[错误代码 {err_code}] 获取节点失败: {exc} | 诊断结果: {raw_diag}"
             set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
             candidates = []
 
         if not candidates:
-            return "没有拉取到新节点"
+            with lock:
+                existing_nodes = read_nodes()
+                active_only = [
+                    node for node in existing_nodes
+                    if active_openvpn_node_id and node.get("id") == active_openvpn_node_id
+                ]
+                write_json(NODES_FILE, active_only)
+            set_state(valid_nodes=0, last_check_message="当前筛选条件没有匹配节点，活动连接已保留")
+            return "当前筛选条件没有匹配节点"
 
         with lock:
             current_nodes = read_nodes()
@@ -1802,14 +2253,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
             if len(merged) > 1000:
                 merged = merged[:1000]
                 
-            for n in merged:
-                config_path = Path(n["config_file"])
-                if not config_path.exists():
-                    try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
-                    except Exception:
-                        pass
-                        
             write_json(NODES_FILE, merged)
 
         initial_tested_ids: set[str] = set()
@@ -1872,7 +2315,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 n for n in current_nodes
                 if not n.get("active") and n.get("id") not in initial_tested_ids
             ]
-            to_test_ids = [n["id"] for n in to_test]
+            to_test.sort(key=probe_priority_key)
+            to_test_ids = [n["id"] for n in to_test[:BACKGROUND_TEST_NODE_LIMIT]]
             
         msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
         print(f"[周期检测] {msg}", flush=True)
@@ -1956,6 +2400,109 @@ def collector_loop() -> None:
         else:
             sleep_time = CHECK_INTERVAL_SECONDS
             
+        time.sleep(sleep_time)
+
+
+def _protected_config_references(nodes: list[dict[str, Any]]) -> tuple[set[str], set[Path]]:
+    ui_cfg = load_ui_config()
+    protected_ids = {
+        str(node.get("id") or "")
+        for node in nodes
+        if node.get("active") and node.get("id")
+    }
+    protected_ids.update(str(node_id) for node_id in ui_cfg.get("favorite_node_ids", []) if node_id)
+    fixed_node_id = str(ui_cfg.get("fixed_node_id") or "")
+    if fixed_node_id:
+        protected_ids.add(fixed_node_id)
+    if active_openvpn_node_id:
+        protected_ids.add(active_openvpn_node_id)
+
+    stored_state = read_json(STATE_FILE, {})
+    stored_active_id = str(stored_state.get("active_openvpn_node_id") or "")
+    if stored_active_id:
+        protected_ids.add(stored_active_id)
+    stored_tunnels = stored_state.get("tunnels")
+    if isinstance(stored_tunnels, dict):
+        stored_active = stored_tunnels.get("active")
+        if isinstance(stored_active, dict) and stored_active.get("node_id"):
+            protected_ids.add(str(stored_active["node_id"]))
+        for handle in stored_tunnels.get("draining", []):
+            if isinstance(handle, dict) and handle.get("node_id"):
+                protected_ids.add(str(handle["node_id"]))
+
+    protected_paths: set[Path] = set()
+    active_handle = tunnel_slots.active()
+    handles = ([active_handle] if active_handle is not None else []) + tunnel_slots.draining()
+    for handle in handles:
+        if handle.node_id:
+            protected_ids.add(handle.node_id)
+        if handle.config_file:
+            protected_paths.add(Path(handle.config_file))
+    return protected_ids, protected_paths
+
+
+def run_config_cleanup() -> dict[str, Any]:
+    if not config_cleanup_lock.acquire(blocking=False):
+        return {"skipped": True, "reason": "cleanup_already_running"}
+    maintenance_acquired = False
+    try:
+        maintenance_acquired = maintenance_lock.acquire(blocking=False)
+        if not maintenance_acquired:
+            return {"skipped": True, "reason": "maintenance_running"}
+        with lock:
+            if is_connecting:
+                return {"skipped": True, "reason": "connection_or_test_running"}
+            nodes = read_nodes()
+            protected_ids, protected_paths = _protected_config_references(nodes)
+            result = cleanup_config_cache(
+                CONFIG_DIR,
+                nodes,
+                protected_node_ids=protected_ids,
+                protected_paths=protected_paths,
+                policy=ConfigCleanupPolicy(
+                    max_files=CONFIG_MAX_FILES,
+                    max_age_seconds=CONFIG_MAX_AGE_SECONDS,
+                    invalid_grace_seconds=CONFIG_INVALID_GRACE_SECONDS,
+                    orphan_grace_seconds=CONFIG_ORPHAN_GRACE_SECONDS,
+                    temp_max_age_seconds=CONFIG_TEMP_MAX_AGE_SECONDS,
+                ),
+            )
+            if result.nodes != nodes:
+                write_json(NODES_FILE, result.nodes)
+
+        cleanup_state = {
+            "last_run_at": time.time(),
+            "protected_nodes": len(protected_ids),
+            **result.to_state(),
+        }
+        set_state(config_cleanup=cleanup_state)
+        summary = (
+            f"配置缓存清理完成：扫描 {result.scanned_files} 个，删除 {result.deleted_files} 个，"
+            f"剩余 {result.remaining_files} 个，释放 {result.deleted_bytes} 字节"
+        )
+        print(f"[配置清理] {summary}", flush=True)
+        log_to_json("WARNING" if result.errors else "INFO", "ConfigCleanup", summary)
+        return cleanup_state
+    finally:
+        if maintenance_acquired:
+            maintenance_lock.release()
+        config_cleanup_lock.release()
+
+
+def config_cleanup_loop() -> None:
+    if CONFIG_CLEANUP_INITIAL_DELAY_SECONDS:
+        time.sleep(CONFIG_CLEANUP_INITIAL_DELAY_SECONDS)
+    while True:
+        sleep_time = CONFIG_CLEANUP_INTERVAL_SECONDS
+        try:
+            result = run_config_cleanup()
+            if result.get("skipped"):
+                print(f"[配置清理] 本轮跳过：{result.get('reason', 'busy')}", flush=True)
+                sleep_time = min(60, CONFIG_CLEANUP_INTERVAL_SECONDS)
+        except Exception as exc:
+            print(f"[配置清理] 执行失败：{exc}", flush=True)
+            log_to_json("ERROR", "ConfigCleanup", f"配置缓存清理失败: {exc}")
+            sleep_time = min(60, CONFIG_CLEANUP_INTERVAL_SECONDS)
         time.sleep(sleep_time)
 
 LOGIN_HTML = r"""<!DOCTYPE html>
@@ -4879,12 +5426,13 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
+    # 2. 检测当前代理选中的虚拟网卡是否存在 (Linux 下)
+    egress_interface = proxy_server.get_active_interface()
+    tun_path = Path("/sys/class/net") / egress_interface
     if sys.platform.startswith("linux") and not tun_path.exists():
         return {
             "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 ({egress_interface}) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
@@ -5059,6 +5607,20 @@ def active_node_pinger() -> None:
         time.sleep(10)
 
 
+WEBUI_ASSETS = {
+    "/assets/app.css": ("assets/app.css", "text/css; charset=utf-8"),
+    "/assets/app.js": ("assets/app.js", "application/javascript; charset=utf-8"),
+}
+
+
+def load_webui_file(relative_path: str, fallback: str = "") -> bytes:
+    file_path = WEBUI_DIR / relative_path
+    try:
+        return file_path.read_bytes()
+    except OSError:
+        return fallback.encode("utf-8")
+
+
 class Handler(BaseHTTPRequestHandler):
     def get_secret_path(self) -> str:
         ui_cfg = load_ui_config()
@@ -5151,7 +5713,58 @@ class Handler(BaseHTTPRequestHandler):
                 return
                 
         if effective_path in ("/", "/index.html"):
-            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            self.send_bytes(load_webui_file("index.html", INDEX_HTML), "text/html; charset=utf-8")
+        elif effective_path in WEBUI_ASSETS:
+            relative_path, content_type = WEBUI_ASSETS[effective_path]
+            body = load_webui_file(relative_path)
+            if not body:
+                self.send_json({"error": "asset not found"}, HTTPStatus.NOT_FOUND)
+            else:
+                self.send_bytes(body, content_type)
+        elif effective_path == "/api/state":
+            self.send_json({"state": get_state()})
+        elif effective_path == "/api/node_source_options":
+            try:
+                self.send_json(
+                    {
+                        "catalogs": ["vpngate", "publicvpnlist", "all"],
+                        "protocols": ["tcp", "udp"],
+                        "publicvpnlist_sources": publicvpnlist_client.fetch_source_names(),
+                    }
+                )
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "catalogs": ["vpngate", "publicvpnlist", "all"],
+                        "protocols": ["tcp", "udp"],
+                        "publicvpnlist_sources": [],
+                        "error": str(exc),
+                    },
+                    HTTPStatus.BAD_GATEWAY,
+                )
+        elif effective_path == "/api/v2/nodes":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            page = bounded_int((query.get("page") or [1])[0], 1, 1, 1_000_000)
+            page_size = bounded_int((query.get("page_size") or [50])[0], 50, 1, 100)
+            nodes = read_nodes()
+            total = len(nodes)
+            start = (page - 1) * page_size
+            items = []
+            for node in nodes[start : start + page_size]:
+                stripped = node.copy()
+                stripped.pop("config_text", None)
+                items.append(stripped)
+            self.send_json(
+                {
+                    "items": items,
+                    "pagination": {
+                        "page": page,
+                        "page_size": page_size,
+                        "total": total,
+                    },
+                    "state": get_state(),
+                }
+            )
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
@@ -5191,10 +5804,14 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 nodes = read_nodes()
                 node = next((n for n in nodes if Path(n.get("config_file", "")).name == filename), None)
-            if node and node.get("config_text"):
-                self.send_bytes(node["config_text"].encode("utf-8"), "application/x-openvpn-profile")
-            else:
+            if not node:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                return
+            try:
+                node = ensure_node_config(node)
+                self.send_bytes(node["config_text"].encode("utf-8"), "application/x-openvpn-profile")
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         elif effective_path == "/api/gateway_status":
             web_ui_status = {
                 "name": "Web 管理服务",
@@ -5246,8 +5863,8 @@ class Handler(BaseHTTPRequestHandler):
             if ovpn_ok:
                 ovpn_details = f"已连接节点: {active_openvpn_node_id}"
                 if sys.platform.startswith("linux"):
-                    if not Path("/sys/class/net/tun0").exists():
-                        ovpn_err = "[警告] 虚拟网卡 (tun0) 未启用，可能存在策略路由配置问题。"
+                    if not (Path("/sys/class/net") / active_openvpn_interface).exists():
+                        ovpn_err = f"[警告] 虚拟网卡 ({active_openvpn_interface}) 未启用，可能存在策略路由配置问题。"
             else:
                 if active_openvpn_node_id:
                     ovpn_err = "连接已中断或 OpenVPN 核心程序异常退出。"
@@ -5512,6 +6129,47 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
+        elif effective_path == "/api/update_node_filters":
+            try:
+                payload = self.read_json_body()
+                ui_cfg = load_ui_config()
+                merged_filter_values = dict(ui_cfg)
+                merged_filter_values.update(payload)
+                filters = NodeFilters.from_mapping(merged_filter_values)
+                ui_cfg.update(filters.to_dict())
+                auth_file = DATA_DIR / "ui_auth.json"
+                with lock:
+                    DATA_DIR.mkdir(exist_ok=True, parents=True)
+                    write_json(auth_file, ui_cfg)
+
+                if maintenance_lock.locked():
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "accepted": False,
+                            "running": True,
+                            "filters": filters.to_dict(),
+                            "message": "筛选条件已保存，当前维护任务结束后生效",
+                        }
+                    )
+                else:
+                    threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "accepted": True,
+                            "running": True,
+                            "filters": filters.to_dict(),
+                            "message": "筛选条件已保存，节点刷新已在后台启动",
+                        },
+                        HTTPStatus.ACCEPTED,
+                    )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         elif effective_path == "/api/update_routing":
             try:
                 payload = self.read_json_body()
@@ -5603,6 +6261,22 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": True, "message": "已在后台启动节点更新流程", "running": False})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/v2/latency":
+            try:
+                payload = self.read_json_body(max_bytes=262144)
+                node_ids = payload.get("ids", [])
+                if not isinstance(node_ids, list):
+                    self.send_json({"ok": False, "error": "节点 ID 列表无效"}, HTTPStatus.BAD_REQUEST)
+                    return
+                node_ids = [str(node_id or "").strip() for node_id in node_ids]
+                node_ids = [node_id for node_id in node_ids if node_id]
+                if len(node_ids) > 100:
+                    self.send_json({"ok": False, "error": "单次最多测量 100 个节点延迟"}, HTTPStatus.BAD_REQUEST)
+                    return
+                results = measure_node_latencies(node_ids)
+                self.send_json({"ok": True, "results": results})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
             try:
                 payload = self.read_json_body(max_bytes=262144)
@@ -5637,6 +6311,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
             try:
+                if is_connecting:
+                    self.send_json(
+                        {"ok": False, "error": "当前正在建立候选隧道，请等待切换完成后再断开"},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
                 ui_cfg = load_ui_config()
                 ui_cfg["connection_enabled"] = False
                 auth_file = DATA_DIR / "ui_auth.json"
@@ -5655,6 +6335,20 @@ class Handler(BaseHTTPRequestHandler):
                 last_active_latency = 0
                 set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接")
                 self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/connect_async":
+            try:
+                payload = self.read_json_body()
+                job_id = queue_connect_node(str(payload.get("id") or ""))
+                self.send_json(
+                    {"ok": True, "accepted": True, "job_id": job_id},
+                    HTTPStatus.ACCEPTED,
+                )
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except RuntimeError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":
@@ -5738,6 +6432,8 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
+    cleanup_policy_routing()
+    proxy_server.set_active_interface("tun0")
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -5808,6 +6504,7 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    threading.Thread(target=config_cleanup_loop, daemon=True, name="config-cleanup").start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)

@@ -1,67 +1,47 @@
-# ============================================
-#  AimiliVPN .gitignore
-# ============================================
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
 
-# ---- Nuitka 编译产物 ----
+# Runtime state and credentials
+vpngate_data/
+logs/
+*.log
+*.pid
+*.tmp
+*.ovpn
+*.auth
+*.key
+*.pem
+.env
+.env.*
+
+# Compiled and packaged output
 vpngate_manager.build/
 vpngate_manager.dist/
 *.build/
 *.dist/
-aimilivpn
-
-# ---- Debian 打包产物 ----
 *.deb
+aimilivpn
 aimilivpn_*
 
-# ---- Python 缓存 ----
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.egg-info/
-dist/
-build/
-*.egg
+# Local previews, deployment snapshots, and tool state
+output/
+frontend-preview.html
+.agents/
+.playwright-cli/
+/(\{ready
+/(\{scrollWidth
 
-# ---- 运行时数据 ----
-vpngate_data/
-logs/
-*.log
-*.tmp
-*.pid
-
-# ---- IDE 和编辑器 ----
+# Editors and operating systems
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.project
-.classpath
-.settings/
-
-# ---- AI 编码助手 ----
-.gemini/
-.cursor/
-.cursorrules
-.aider*
-.codeium/
-.continue/
-.copilot/
-
-# ---- 本地开发文档（不上传 GitHub） ----
-AI开发指令.md
-功能文档.md
-AimiliVPN_Analysis_ZH.md
-
-# ---- 临时和测试文件 ----
-scratch/
-*连接配置*
-test_*.py
-*.bak
-*.orig
-
-# ---- 系统文件 ----
 .DS_Store
 Thumbs.db
 Desktop.ini

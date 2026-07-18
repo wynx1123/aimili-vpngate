@@ -1,0 +1,396 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#010828">
+  <title>AimiliVPN Route Deck</title>
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Condiment&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <link rel="stylesheet" href="./assets/app.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><i data-lucide="route"></i></div>
+        <div>
+          <h1 class="brand-name">AimiliVPN</h1>
+          <span class="brand-subtitle">route control / live console</span>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div class="live-chip"><span class="live-dot"></span><span id="top-live-text">出口在线</span></div>
+        <button class="icon-button" id="open-settings" type="button" title="管理设置" aria-label="管理设置"><i data-lucide="sliders-horizontal"></i></button>
+      </div>
+    </header>
+
+    <section class="intro" aria-labelledby="route-heading">
+      <h2 class="route-title" id="route-heading">
+        Route control
+        <span class="route-title-line"><span class="route-script">live</span> exchange</span>
+      </h2>
+      <div class="summary-line" aria-label="路由摘要">
+        <span>接口 <strong id="summary-interface">tun0</strong></span>
+        <span>协议 <strong id="summary-protocol">TCP</strong></span>
+        <span>出口 <strong id="summary-country">日本</strong></span>
+        <span>策略 <strong id="summary-routing">智能自动</strong></span>
+      </div>
+    </section>
+
+    <section class="route-stage" aria-label="节点状态舞台">
+      <article class="stage-column stage-column--waiting" id="waiting-stage">
+        <div class="stage-kicker"><span>Waiting pool</span><span class="stage-index">01 / 待检测</span></div>
+        <div class="video-shell liquid-glass">
+          <div class="video-frame">
+            <video autoplay loop muted playsinline preload="metadata" aria-label="待检测节点动画人物">
+              <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260331_053923_22c0a6a5-313c-474c-85ff-3b50d25e944a.mp4" type="video/mp4">
+            </video>
+            <span class="video-state" id="waiting-video-state">排队中</span>
+            <span class="scan-line" aria-hidden="true"></span>
+            <div class="video-fallback">待检测节点动画<br>视频资源暂不可用</div>
+          </div>
+        </div>
+        <div class="stage-bar liquid-glass">
+          <div>
+            <span class="stage-label">Pending checks</span>
+            <div class="stage-value"><strong id="waiting-count">0</strong><span id="waiting-caption">个节点等待测量</span></div>
+          </div>
+          <button class="round-button" id="scan-pending" type="button" title="测量待检测节点" aria-label="测量待检测节点"><i data-lucide="scan-line"></i></button>
+        </div>
+      </article>
+
+      <article class="stage-column stage-column--active" id="active-stage">
+        <div class="stage-kicker"><span>Live egress</span><span class="stage-index">02 / 当前连接</span></div>
+        <div class="video-shell liquid-glass">
+          <div class="video-frame">
+            <video autoplay loop muted playsinline preload="metadata" aria-label="当前连接动画人物">
+              <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260331_054411_511c1b7a-fb2f-42ef-bf6c-32c0b1a06e79.mp4" type="video/mp4">
+            </video>
+            <span class="video-state" id="active-video-state">已连接</span>
+            <div class="video-fallback">当前连接动画<br>视频资源暂不可用</div>
+          </div>
+        </div>
+        <div class="stage-bar liquid-glass">
+          <div>
+            <span class="stage-label">Current node</span>
+            <div class="stage-value"><strong id="active-latency">42 ms</strong><span id="active-caption">出口稳定</span></div>
+          </div>
+          <button class="round-button" id="disconnect-active" type="button" title="断开当前连接" aria-label="断开当前连接"><i data-lucide="power"></i></button>
+        </div>
+        <dl class="node-facts" aria-label="当前节点信息">
+          <div class="fact"><dt>IP 地址</dt><dd class="data" id="fact-ip">-</dd></div>
+          <div class="fact"><dt>纯净度判断</dt><dd class="good" id="fact-purity">-</dd></div>
+          <div class="fact"><dt>IP 类型</dt><dd id="fact-type">-</dd></div>
+          <div class="fact"><dt>城市</dt><dd id="fact-city">-</dd></div>
+          <div class="fact"><dt>节点来源</dt><dd id="fact-source">-</dd></div>
+          <div class="fact"><dt>传输协议</dt><dd class="data" id="fact-protocol">-</dd></div>
+        </dl>
+      </article>
+
+      <article class="stage-column stage-column--available" id="available-stage">
+        <div class="stage-kicker"><span>Ready pool</span><span class="stage-index">03 / 可用节点</span></div>
+        <div class="video-shell liquid-glass">
+          <div class="video-frame">
+            <video autoplay loop muted playsinline preload="metadata" aria-label="可用节点动画人物">
+              <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260331_053923_22c0a6a5-313c-474c-85ff-3b50d25e944a.mp4#t=1.8" type="video/mp4">
+            </video>
+            <span class="video-state">随时可切换</span>
+            <div class="video-fallback">可用节点动画<br>视频资源暂不可用</div>
+          </div>
+        </div>
+        <div class="stage-bar liquid-glass">
+          <div>
+            <span class="stage-label">Available nodes</span>
+            <div class="stage-value"><strong id="available-count">0</strong><span>个备用出口</span></div>
+          </div>
+          <button class="round-button" id="switch-fastest" type="button" title="切换到最快节点" aria-label="切换到最快节点"><i data-lucide="fast-forward"></i></button>
+        </div>
+      </article>
+    </section>
+
+    <section class="list-section" aria-labelledby="nodes-heading">
+      <div class="list-header">
+        <div class="list-title-wrap">
+          <h2 class="list-title" id="nodes-heading">Node list</h2>
+          <span class="list-count" id="filtered-count">0 / 0</span>
+        </div>
+        <div class="list-actions">
+          <button class="button" id="measure-visible" type="button"><i data-lucide="activity"></i>测量当前列表</button>
+          <button class="button button--neon" id="refresh-nodes" type="button"><i data-lucide="refresh-cw"></i>更新节点</button>
+        </div>
+      </div>
+
+      <div class="filter-bar" aria-label="节点列表筛选">
+        <label class="field">
+          <i data-lucide="search"></i>
+          <input id="search-filter" type="search" placeholder="搜索 IP、城市或来源" aria-label="搜索节点">
+        </label>
+        <label class="field">
+          <select id="status-filter" aria-label="状态筛选">
+            <option value="all">全部状态</option>
+            <option value="available">可用</option>
+            <option value="pending">待检测</option>
+            <option value="unavailable">不可用</option>
+          </select>
+        </label>
+        <label class="field">
+          <select id="type-filter" aria-label="IP 类型筛选">
+            <option value="all">全部 IP 类型</option>
+            <option value="residential">住宅 IP</option>
+            <option value="hosting">机房 IP</option>
+            <option value="mobile">移动网络</option>
+          </select>
+        </label>
+        <label class="field">
+          <select id="latency-filter" aria-label="最大延迟筛选">
+            <option value="0">不限延迟</option>
+            <option value="80">80 ms 内</option>
+            <option value="150">150 ms 内</option>
+            <option value="250">250 ms 内</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 12%">状态</th>
+              <th style="width: 18%">IP 地址</th>
+              <th style="width: 15%">城市</th>
+              <th style="width: 12%">IP 类型</th>
+              <th style="width: 14%">来源</th>
+              <th style="width: 9%">协议</th>
+              <th style="width: 8%">延迟</th>
+              <th style="width: 12%; text-align: right">操作</th>
+            </tr>
+          </thead>
+          <tbody id="node-rows"></tbody>
+        </table>
+      </div>
+      <div class="mobile-node-list" id="mobile-node-list"></div>
+    </section>
+  </main>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+
+  <div class="drawer-backdrop" id="settings-backdrop" role="presentation">
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="drawer-header">
+        <div>
+          <h2 class="drawer-title" id="settings-title">Management</h2>
+          <span class="drawer-subtitle">route / source / network / security</span>
+        </div>
+        <button class="icon-button" id="close-settings" type="button" title="关闭设置" aria-label="关闭设置"><i data-lucide="x"></i></button>
+      </div>
+
+      <nav class="settings-tabs" role="tablist" aria-label="管理设置分类">
+        <button class="settings-tab is-active" id="tab-routing" type="button" role="tab" aria-selected="true" aria-controls="panel-routing" data-settings-tab="routing"><i data-lucide="route"></i><span>路由策略</span></button>
+        <button class="settings-tab" id="tab-source" type="button" role="tab" aria-selected="false" aria-controls="panel-source" data-settings-tab="source"><i data-lucide="database"></i><span>节点来源</span></button>
+        <button class="settings-tab" id="tab-network" type="button" role="tab" aria-selected="false" aria-controls="panel-network" data-settings-tab="network"><i data-lucide="network"></i><span>代理网络</span></button>
+        <button class="settings-tab" id="tab-security" type="button" role="tab" aria-selected="false" aria-controls="panel-security" data-settings-tab="security"><i data-lucide="shield-check"></i><span>账号安全</span></button>
+      </nav>
+
+      <section class="settings-panel" id="panel-routing" role="tabpanel" aria-labelledby="tab-routing">
+        <div class="settings-panel-heading">
+          <h3>出站路由策略</h3>
+          <p>选择节点失效后的处理方式。固定国家和固定 IP 会严格保持目标范围。</p>
+        </div>
+        <form class="drawer-form" id="routing-form">
+          <div class="mode-grid" role="radiogroup" aria-label="路由模式">
+            <label class="mode-option">
+              <input type="radio" name="routing-mode" value="auto" checked>
+              <strong>智能自动</strong>
+              <span>选择延迟最低的健康节点，失效时自动切换。</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="routing-mode" value="fixed_region">
+              <strong>固定国家</strong>
+              <span>只连接指定国家，不跨国家自动回退。</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="routing-mode" value="fixed_ip">
+              <strong>固定 IP 地址</strong>
+              <span>锁定一个节点，故障时只重连同一 IP。</span>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="routing-mode" value="favorites">
+              <strong>仅使用收藏</strong>
+              <span>只在已收藏节点中检测和自动切换。</span>
+            </label>
+          </div>
+
+          <div class="drawer-field conditional-field" id="fixed-country-field" hidden>
+            <label for="routing-country">锁定国家或地区</label>
+            <select id="routing-country">
+              <option value="">请选择国家</option>
+              <option value="日本" selected>日本 · 3 个候选</option>
+              <option value="韩国">韩国 · 1 个候选</option>
+              <option value="新加坡">新加坡 · 1 个候选</option>
+              <option value="美国">美国 · 1 个候选</option>
+              <option value="中国台湾">中国台湾 · 1 个候选</option>
+            </select>
+            <p class="field-note">该国家全部节点失效时代理会中断，不会切换到其他国家。</p>
+          </div>
+
+          <div class="conditional-field" id="fixed-ip-field" hidden>
+            <div class="drawer-field">
+              <label for="routing-fixed-ip">锁定节点 IP</label>
+              <select id="routing-fixed-ip">
+                <option value="103.156.22.48">103.156.22.48 · 东京 · 当前连接</option>
+                <option value="211.216.68.73">211.216.68.73 · 首尔 · 58 ms</option>
+                <option value="126.88.14.201">126.88.14.201 · 大阪 · 66 ms</option>
+                <option value="61.228.90.144">61.228.90.144 · 台北 · 78 ms</option>
+              </select>
+            </div>
+            <div class="current-lock">
+              <div><span>当前锁定目标</span><strong id="fixed-ip-summary">103.156.22.48</strong></div>
+              <span class="status-badge status-active">在线</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <h4 class="settings-section-title">IP 类型限制</h4>
+            <div class="segmented" role="radiogroup" aria-label="IP 类型限制">
+              <label class="segment-option"><input type="radio" name="routing-ip-type" value="all" checked><span>全部类型</span></label>
+              <label class="segment-option"><input type="radio" name="routing-ip-type" value="residential"><span>住宅优先</span></label>
+              <label class="segment-option"><input type="radio" name="routing-ip-type" value="hosting"><span>仅机房</span></label>
+            </div>
+          </div>
+
+          <div class="settings-error" id="routing-error"></div>
+          <div class="drawer-actions">
+            <button class="button" type="button" data-close-settings>取消</button>
+            <button class="button button--neon" type="submit">保存路由策略</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="settings-panel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden>
+        <div class="settings-panel-heading">
+          <h3>节点来源与筛选</h3>
+          <p>先筛选元数据，再对候选节点测量延迟；配置仅在测试或连接时下载。</p>
+        </div>
+        <form class="drawer-form" id="source-form">
+          <div class="drawer-field">
+            <label for="source-catalog">节点目录</label>
+            <select id="source-catalog"><option value="all">全部来源</option><option value="vpngate">VPNGate</option><option value="publicvpnlist">PublicVPNList</option></select>
+          </div>
+          <div class="drawer-field">
+            <label for="source-name">具体节点来源</label>
+            <select id="source-name"><option value="">全部提供方</option></select>
+          </div>
+          <div class="drawer-field">
+            <label for="source-country">国家或地区</label>
+            <input id="source-country" value="japan" placeholder="例如 japan">
+          </div>
+          <div class="drawer-field">
+            <label for="source-protocol">OpenVPN 传输协议</label>
+            <select id="source-protocol"><option value="">全部协议</option><option value="tcp">TCP</option><option value="udp">UDP</option></select>
+          </div>
+          <div class="inline-fields">
+            <div class="drawer-field">
+              <label for="source-speed">最低速度 Mbps</label>
+              <input id="source-speed" type="number" min="0" value="50">
+            </div>
+            <div class="drawer-field">
+              <label for="source-latency">最大延迟 ms</label>
+              <input id="source-latency" type="number" min="0" value="150">
+            </div>
+          </div>
+          <div class="drawer-field">
+            <label for="source-purity">IP 纯净度</label>
+            <select id="source-purity"><option value="any">不限</option><option value="proxy_free">未发现代理特征</option><option value="residential">住宅 IP</option><option value="hosting">机房 IP</option></select>
+          </div>
+          <div class="toggle-line"><label for="only-verified">仅显示已验证节点</label><input id="only-verified" type="checkbox"></div>
+          <div class="toggle-line"><label for="only-downloadable">仅显示可下载配置</label><input id="only-downloadable" type="checkbox" checked></div>
+          <div class="drawer-actions">
+            <button class="button" type="button" data-close-settings>取消</button>
+            <button class="button button--neon" type="submit">应用来源筛选</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="settings-panel" id="panel-network" role="tabpanel" aria-labelledby="tab-network" hidden>
+        <div class="settings-panel-heading">
+          <h3>本地代理网络</h3>
+          <p>调整 HTTP/SOCKS5 统一入口。代理端口变化后服务需要重启。</p>
+        </div>
+        <form class="drawer-form" id="network-form">
+          <div class="inline-fields">
+            <div class="drawer-field">
+              <label for="proxy-host">监听地址</label>
+              <input id="proxy-host" value="127.0.0.1" readonly>
+            </div>
+            <div class="drawer-field">
+              <label for="proxy-port">代理端口</label>
+              <input id="proxy-port" type="number" min="1024" max="65535" value="7928">
+            </div>
+          </div>
+          <div class="current-lock">
+            <div><span>统一代理入口</span><strong>http://127.0.0.1:<span id="proxy-port-preview">7928</span></strong></div>
+            <span class="status-badge status-active">监听中</span>
+          </div>
+          <p class="field-note">默认只允许 VPS 本机访问。公开到公网前应另外配置认证和防火墙来源限制。</p>
+          <div class="settings-error" id="network-error"></div>
+          <div class="drawer-actions">
+            <button class="button" type="button" data-close-settings>取消</button>
+            <button class="button button--neon" type="submit">保存代理设置</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="settings-panel" id="panel-security" role="tabpanel" aria-labelledby="tab-security" hidden>
+        <div class="settings-panel-heading">
+          <h3>管理账号与入口</h3>
+          <p>修改用户名或密码会清除现有会话；端口或安全路径变化会重启管理服务。</p>
+        </div>
+        <form class="drawer-form" id="security-form">
+          <div class="drawer-field">
+            <label for="admin-username">管理用户名</label>
+            <input id="admin-username" autocomplete="username" value="admin">
+          </div>
+          <div class="inline-fields">
+            <div class="drawer-field">
+              <label for="admin-password">新密码</label>
+              <input id="admin-password" type="password" autocomplete="new-password" placeholder="留空则不修改">
+            </div>
+            <div class="drawer-field">
+              <label for="admin-password-confirm">确认新密码</label>
+              <input id="admin-password-confirm" type="password" autocomplete="new-password" placeholder="再次输入新密码">
+            </div>
+          </div>
+          <div class="inline-fields">
+            <div class="drawer-field">
+              <label for="admin-port">管理网页端口</label>
+              <input id="admin-port" type="number" min="1" max="65535" value="8787">
+            </div>
+            <div class="drawer-field">
+              <label for="admin-secret">登录安全路径</label>
+              <div class="input-action">
+                <input id="admin-secret" value="EJsW2EeBo9lY" maxlength="32">
+                <button class="icon-button" id="generate-secret" type="button" title="生成新安全路径" aria-label="生成新安全路径"><i data-lucide="dices"></i></button>
+              </div>
+            </div>
+          </div>
+          <div class="current-lock">
+            <div><span>当前管理入口</span><strong id="admin-url-preview">http://your-vps:8787/EJsW2EeBo9lY/</strong></div>
+            <span class="status-badge status-active">受保护</span>
+          </div>
+          <div class="settings-error" id="security-error"></div>
+          <div class="drawer-actions">
+            <button class="button button--danger" id="logout-session" type="button"><i data-lucide="log-out"></i>退出登录</button>
+            <button class="button button--neon" type="submit">保存账号设置</button>
+          </div>
+        </form>
+      </section>
+    </aside>
+  </div>
+
+  <script src="./assets/app.js" defer></script>
+</body>
+</html>
