@@ -124,6 +124,7 @@ MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 BACKGROUND_TEST_NODE_LIMIT = env_int("BACKGROUND_TEST_NODE_LIMIT", 15, 1, 100)
 LATENCY_PROBE_WORKERS = env_int("LATENCY_PROBE_WORKERS", 10, 1, 50)
+OPENVPN_TEST_WORKERS = env_int("OPENVPN_TEST_WORKERS", 2, 1, 10)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -205,6 +206,46 @@ def upstream_proxy_auth_file() -> str | None:
         print(f"[上游代理认证] 写入认证文件失败: {exc}", flush=True)
         return None
 
+def persist_embedded_node_config(node: dict[str, Any]) -> bool:
+    """Persist an embedded OpenVPN profile before compacting nodes.json."""
+    config_text = str(node.get("config_text") or "")
+    if not config_text:
+        return False
+
+    node_id = str(node.get("id") or "node").strip() or "node"
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", node_id).strip("._") or "node"
+    config_path = Path(node.get("config_file") or (CONFIG_DIR / f"{safe_id}.ovpn"))
+    temp_path: Path | None = None
+    try:
+        config_path.parent.mkdir(exist_ok=True, parents=True)
+        existing = ""
+        if config_path.exists():
+            existing = config_path.read_text(encoding="utf-8", errors="replace")
+        if existing != config_text:
+            temp_path = config_path.with_name(f".{config_path.name}.{uuid.uuid4().hex}.tmp")
+            temp_path.write_text(config_text, encoding="utf-8")
+            try:
+                temp_path.chmod(0o600)
+            except OSError:
+                pass
+            temp_path.replace(config_path)
+        try:
+            config_path.chmod(0o600)
+        except OSError:
+            pass
+        node["config_file"] = str(config_path)
+        node["config_cached_at"] = time.time()
+        return True
+    except OSError as exc:
+        print(f"[配置缓存] 保存节点 {node_id} 的 OpenVPN 配置失败: {exc}", flush=True)
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
 def write_json(path: Path, data: Any) -> None:
     with lock:
         serialized_data = data
@@ -214,7 +255,8 @@ def write_json(path: Path, data: Any) -> None:
             for item in data:
                 if isinstance(item, dict):
                     stripped = item.copy()
-                    stripped.pop("config_text", None)
+                    if persist_embedded_node_config(stripped):
+                        stripped.pop("config_text", None)
                     serialized_data.append(stripped)
                 else:
                     serialized_data.append(item)
@@ -1027,8 +1069,7 @@ def _ensure_node_config_unlocked(node: dict[str, Any]) -> dict[str, Any]:
         if node.get("catalog_source") != "publicvpnlist":
             raise RuntimeError(f"节点 {node_id} 没有可用的 OpenVPN 配置")
         try:
-            legacy_id = int(node.get("legacy_id") or 0)
-            config_text = publicvpnlist_client.download_openvpn_config(legacy_id)
+            config_text = publicvpnlist_client.download_openvpn_config(node)
         except (ValueError, SourceError) as exc:
             raise RuntimeError(f"PublicVPNList 节点配置下载失败: {exc}") from exc
 
@@ -1109,6 +1150,10 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
             "1",
             "--connect-timeout",
             "15",
+            "--ping",
+            "10",
+            "--ping-restart",
+            "60",
             "--auth-user-pass",
             str(AUTH_FILE),
             "--auth-nocache",
@@ -1143,7 +1188,10 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
         pass
         
     if route_nopull:
-        command.append("--route-nopull")
+        # Profiles commonly contain redirect-gateway.  route-nopull alone
+        # does not suppress routes declared directly in the profile, so also
+        # disable OpenVPN route execution and install only our own table.
+        command.extend(["--route-nopull", "--route-noexec"])
     return command
 
 def stop_process(process: subprocess.Popen[str] | None) -> None:
@@ -1787,7 +1835,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    max_workers = min(5, max(1, len(to_test)))
+    max_workers = min(OPENVPN_TEST_WORKERS, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
