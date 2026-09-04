@@ -29,6 +29,8 @@ AimiliVPN Enhanced 是部署在 Linux VPS 上的 OpenVPN 出口管理与 HTTP/SO
 | 右侧：可用节点 | 已通过检测、可以切换的节点 | 一键切换最低延迟节点 |
 | 下方：节点列表 | 当前节点全集及筛选结果 | 搜索、按状态/IP 类型/延迟筛选、测速、收藏、切换 |
 
+节点列表中的“测速”执行的是轻量端点延迟探测，不会下载 `.ovpn` 或启动 OpenVPN；完整可用性检测由后台维护任务低并发执行。这样手动查看延迟不会因为批量建立测试隧道而拖慢页面或影响 VPS。
+
 ### 二次开发新增功能
 
 - VPNGate 与 PublicVPNList 双来源，可分别使用或合并。
@@ -364,6 +366,7 @@ journalctl -u aimilivpn -n 200 --no-pager
 | `UI_PORT` | `8787` | 管理界面初始端口 |
 | `BACKGROUND_TEST_NODE_LIMIT` | `15` | 后台单轮完整测试上限 |
 | `LATENCY_PROBE_WORKERS` | `10` | 并发延迟探测数 |
+| `OPENVPN_TEST_WORKERS` | `2` | 后台完整 OpenVPN 测试并发数；VPS 不稳定时可调为 `1` |
 | `TUNNEL_DRAIN_SECONDS` | `45` | 旧隧道最短排空时间 |
 | `TUNNEL_DRAIN_MAX_SECONDS` | `180` | 旧隧道最长排空时间 |
 | `CONFIG_CLEANUP_INITIAL_DELAY_SECONDS` | `60` | 启动后首次清理延迟 |
@@ -372,6 +375,8 @@ journalctl -u aimilivpn -n 200 --no-pager
 | `CONFIG_MAX_AGE_SECONDS` | `259200` | 普通配置最长缓存时间，默认 3 天 |
 
 清理任务会删除：1 小时以上的遗留测试配置、30 分钟以上的无效节点配置、6 小时以上的孤立配置、3 天以上的普通缓存，以及超过 300 个后的最旧缓存。活动隧道、排空隧道、固定 IP 节点和收藏节点配置会被保护。被删除的 PublicVPNList 配置在下次测速、连接或下载时可按需重新获取，因此文件“重新出现”属于正常行为。
+
+候选隧道使用独立的 `tun0`/`tun1` 路由表。启动 OpenVPN 时禁用节点配置对系统路由的直接执行，并由程序只向对应策略路由表添加默认路由；SSH 和 VPS 上其他项目继续使用物理网卡默认路由。生产环境仍建议观察 `ip rule`、`ip route`、`tun0/tun1` 和 SSH 日志。
 
 ### 常见问题 / 问答
 
@@ -704,6 +709,7 @@ Runtime data lives in `/opt/aimilivpn/vpngate_data/` and can contain credentials
 | `UI_PORT` | `8787` | Initial dashboard port |
 | `BACKGROUND_TEST_NODE_LIMIT` | `15` | Full background tests per round |
 | `LATENCY_PROBE_WORKERS` | `10` | Concurrent endpoint probes |
+| `OPENVPN_TEST_WORKERS` | `2` | Concurrent full OpenVPN tests; use `1` on unstable VPSs |
 | `TUNNEL_DRAIN_SECONDS` | `45` | Minimum old-tunnel drain time |
 | `TUNNEL_DRAIN_MAX_SECONDS` | `180` | Maximum old-tunnel drain time |
 | `CONFIG_CLEANUP_INITIAL_DELAY_SECONDS` | `60` | Delay before the first cleanup |
@@ -712,6 +718,8 @@ Runtime data lives in `/opt/aimilivpn/vpngate_data/` and can contain credentials
 | `CONFIG_MAX_AGE_SECONDS` | `259200` | Normal profile lifetime, three days |
 
 Cleanup removes abandoned test profiles after one hour, unavailable-node profiles after 30 minutes, orphaned profiles after six hours, ordinary profiles after three days, and the oldest unprotected files above the 300-file cap. Active, draining, fixed-IP, and favorite profiles are protected. A removed PublicVPNList profile may be downloaded again when the node is probed, connected, or explicitly downloaded.
+
+The dashboard's manual measurement is a lightweight endpoint-latency probe. It does not download profiles or start OpenVPN; full availability tests remain in the low-concurrency background maintenance path. Candidate tunnels use separate `tun0`/`tun1` policy-routing tables, while the VPS default route remains on the physical interface so SSH and unrelated services are not redirected through a VPN profile.
 
 ### FAQ
 

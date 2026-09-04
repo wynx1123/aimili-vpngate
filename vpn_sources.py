@@ -168,11 +168,13 @@ def apply_node_filters(
 
 
 def normalize_publicvpnlist_payload(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    if payload.get("ok") is not True:
+    if "ok" in payload and payload.get("ok") is not True:
         raise SourceError("PublicVPNList returned ok != true")
     items = payload.get("items")
     if not isinstance(items, list):
-        raise SourceError("PublicVPNList response is missing an items array")
+        items = payload.get("data")
+    if not isinstance(items, list):
+        raise SourceError("PublicVPNList response is missing an items/data array")
 
     nodes: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -190,40 +192,86 @@ def normalize_publicvpnlist_payload(payload: Mapping[str, Any]) -> list[dict[str
         for endpoint in endpoints:
             if not isinstance(endpoint, Mapping):
                 continue
-            legacy_id = _first(endpoint, "legacy_id", "legacyId", "id", default=_first(item, "legacy_id", "legacyId", "id"))
+            source_id = _clean_text(_first(endpoint, "id", "server_id", "serverId", default=_first(item, "id", "server_id", "serverId")), 255)
+            legacy_id = _first(endpoint, "legacy_id", "legacyId", default=_first(item, "legacy_id", "legacyId"))
             try:
                 legacy_id_int = int(legacy_id)
             except (TypeError, ValueError):
-                continue
+                legacy_id_int = 0
 
-            host = _clean_text(_first(endpoint, "resolved_ip", "resolvedIp", "host", "ip", default=_first(item, "resolved_ip", "host", "ip")), 255)
+            host = _clean_text(_first(endpoint, "resolved_ip", "resolvedIp", "host", "ip", "hostname", default=_first(item, "resolved_ip", "resolvedIp", "host", "ip", "hostname")), 255)
             port = _bounded_int(_first(endpoint, "port", default=_first(item, "port")), 0, 0, 65535)
-            proto = _clean_text(_first(endpoint, "transport_protocol", "transportProtocol", "proto", default=_first(item, "transport_protocol", "proto")), 8).lower()
+            proto = _clean_text(_first(endpoint, "transport", "transport_protocol", "transportProtocol", "proto", default=_first(item, "transport", "transport_protocol", "transportProtocol", "proto")), 8).lower()
             if not host or port <= 0 or proto not in {"tcp", "udp"}:
                 continue
 
-            source = _clean_text(_first(endpoint, "source", default=_first(item, "source")), 80)
-            country = _clean_text(_first(endpoint, "countryName", "country_name", "country", default=_first(item, "countryName", "country_name", "country")), 100)
-            country_slug = _slug(_first(endpoint, "country", "country_slug", default=_first(item, "country", "country_slug", default=country)))
-            latency = _bounded_int(_first(endpoint, "latency_ms", "latencyMs", default=_first(item, "latency_ms", "latencyMs")), 0, 0, 60000)
-            speed = _bounded_float(_first(endpoint, "download_mbps", "downloadMbps", default=_first(item, "download_mbps", "downloadMbps")), 0.0, 0.0, 100000.0)
+            source = _clean_text(
+                _first(
+                    endpoint,
+                    "source",
+                    "source_name",
+                    "provider",
+                    "provider_name",
+                    "providerName",
+                    "channel",
+                    "channel_name",
+                    "channelName",
+                    default=_first(
+                        item,
+                        "source",
+                        "source_name",
+                        "provider",
+                        "provider_name",
+                        "providerName",
+                        "channel",
+                        "channel_name",
+                        "channelName",
+                    ),
+                ),
+                80,
+            )
+            country = _clean_text(_first(endpoint, "country_name", "countryName", "country", default=_first(item, "country_name", "countryName", "country")), 100)
+            country_code = _clean_text(_first(endpoint, "country_code", "countryCode", default=_first(item, "country_code", "countryCode")), 16)
+            country_slug = _slug(_first(endpoint, "country_code", "countryCode", "country", "country_slug", default=_first(item, "country_code", "countryCode", "country", "country_slug", default=country)))
+            latency = _bounded_int(_first(endpoint, "latency_ms", "latencyMs", "checker_measured_tunnel_rtt_ms", "source_reported_ping_ms", default=_first(item, "latency_ms", "latencyMs", "checker_measured_tunnel_rtt_ms", "source_reported_ping_ms")), 0, 0, 60000)
+            speed = _bounded_float(_first(endpoint, "speed_mbps", "download_mbps", "downloadMbps", "checker_measured_throughput_mbps", "source_reported_speed_mbps", default=_first(item, "speed_mbps", "download_mbps", "downloadMbps", "checker_measured_throughput_mbps", "source_reported_speed_mbps")), 0.0, 0.0, 100000.0)
             checker_status = _clean_text(_first(endpoint, "checker_status", "checkerStatus", default=_first(item, "checker_status", "checkerStatus")), 40).lower()
-            verified = _as_bool(_first(endpoint, "isVerified", "verified", default=_first(item, "isVerified", "verified"))) or checker_status == "tunnel_ok"
-            downloadable = _as_bool(_first(endpoint, "downloadable", "configAvailable", default=_first(item, "downloadable", "configAvailable")))
+            measurement_quality = _clean_text(_first(endpoint, "measurement_quality", "measurementQuality", default=_first(item, "measurement_quality", "measurementQuality")), 40).lower()
+            measurement_status = _clean_text(_first(endpoint, "measurement_status", "measurementStatus", default=_first(item, "measurement_status", "measurementStatus")), 40).lower()
+            verified = _as_bool(_first(endpoint, "isVerified", "verified", default=_first(item, "isVerified", "verified"))) or checker_status == "tunnel_ok" or measurement_quality == "verified"
+            downloadable_raw = _first(
+                endpoint,
+                "downloadable",
+                "configAvailable",
+                "config_available",
+                default=_first(item, "downloadable", "configAvailable", "config_available"),
+            )
+            config_download_url = _clean_text(_first(endpoint, "config_download_url", "configDownloadUrl", "download_url", "downloadUrl", default=_first(item, "config_download_url", "configDownloadUrl", "download_url", "downloadUrl")), 2048)
+            if downloadable_raw in (None, ""):
+                downloadable = bool(config_download_url or legacy_id_int > 0)
+            else:
+                downloadable = _as_bool(downloadable_raw) and bool(config_download_url or legacy_id_int > 0)
 
-            node_id = f"pvl_{legacy_id_int}_{proto}_{port}"
+            if legacy_id_int > 0:
+                node_id = f"pvl_{legacy_id_int}_{proto}_{port}"
+            elif source_id:
+                node_id = f"{source_id}_{proto}_{port}"
+            else:
+                continue
             if node_id in seen:
                 continue
             seen.add(node_id)
             nodes.append(
                 {
                     "id": node_id,
+                    "source_id": source_id,
                     "legacy_id": legacy_id_int,
                     "catalog_source": "publicvpnlist",
                     "source": source,
                     "protocol": "openvpn",
                     "country": country,
                     "country_slug": country_slug,
+                    "country_code": country_code,
                     "country_short": "",
                     "ip": host,
                     "remote_host": host,
@@ -243,7 +291,11 @@ def normalize_publicvpnlist_payload(payload: Mapping[str, Any]) -> list[dict[str
                     "quality": "",
                     "verified": verified,
                     "downloadable": downloadable,
+                    "config_download_url": config_download_url,
                     "checker_status": checker_status,
+                    "measurement_quality": measurement_quality,
+                    "measurement_status": measurement_status,
+                    "source_url": _clean_text(_first(endpoint, "source_url", "sourceUrl", default=_first(item, "source_url", "sourceUrl")), 2048),
                     "config_text": "",
                     "fetched_at": now,
                     "probe_status": "not_checked",
@@ -347,62 +399,141 @@ class PublicVPNListClient:
             if cached is not None:
                 return cached[:max_candidates]
 
-        nodes: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        total = None
-        for page in range(1, self.max_pages + 1):
-            query: dict[str, Any] = {"page": page, "page_size": self.page_size}
-            if filters.filter_country:
-                query["country"] = _slug(filters.filter_country)
-            if filters.filter_source:
-                query["source"] = filters.filter_source
-            url = PUBLICVPNLIST_API_URL + "?" + urllib.parse.urlencode(query)
-            payload = self._get_json(url)
-            page_nodes = normalize_publicvpnlist_payload(payload)
-            page_nodes = apply_node_filters(page_nodes, filters, include_ip_purity=False)
-            for node in page_nodes:
-                node_id = str(node.get("id") or "")
-                if node_id and node_id not in seen:
-                    nodes.append(node)
-                    seen.add(node_id)
-                    if len(nodes) >= max_candidates:
-                        break
-            if len(nodes) >= max_candidates:
-                break
+        def fetch_pages(*, use_source_query: bool) -> list[dict[str, Any]]:
+            fetched: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            total = None
+            for page in range(1, self.max_pages + 1):
+                # PublicVPNList deployments do not all expose the same query
+                # parameters.  `page` is shared by the current API, while
+                # page_size/source are handled opportunistically below.
+                # 上游 API v1.2+ 只在 legacy=1 时下发 endpoints[].legacy_id，
+                # 而受保护的 ovpn 下载流程（get_token.php）只接受数字 legacy id。
+                # 不带该参数会导致配置下载全部 400 Bad id。
+                query: dict[str, Any] = {"page": page, "legacy": 1}
+                if filters.filter_country:
+                    query["country"] = _slug(filters.filter_country)
+                if use_source_query and filters.filter_source:
+                    query["source"] = filters.filter_source
+                url = PUBLICVPNLIST_API_URL + "?" + urllib.parse.urlencode(query)
+                try:
+                    payload = self._get_json(url)
+                except SourceError:
+                    if use_source_query and filters.filter_source:
+                        # Some live API versions reject `source`; retry the
+                        # same request without it and apply the exact match
+                        # locally after normalization.
+                        return fetch_pages(use_source_query=False)
+                    raise
+                page_nodes = normalize_publicvpnlist_payload(payload)
+                page_nodes = apply_node_filters(page_nodes, filters, include_ip_purity=False)
+                for node in page_nodes:
+                    node_id = str(node.get("id") or "")
+                    if node_id and node_id not in seen:
+                        fetched.append(node)
+                        seen.add(node_id)
+                        if len(fetched) >= max_candidates:
+                            break
+                if len(fetched) >= max_candidates:
+                    break
 
-            raw_items = payload.get("items")
-            if not isinstance(raw_items, list) or not raw_items:
-                break
-            pagination = payload.get("pagination")
-            if isinstance(pagination, Mapping):
-                total = _bounded_int(pagination.get("total"), 0, 0, 10_000_000)
-            if total is not None and page * self.page_size >= total:
-                break
+                raw_items = payload.get("items")
+                if not isinstance(raw_items, list):
+                    raw_items = payload.get("data")
+                if not isinstance(raw_items, list) or not raw_items:
+                    break
+                pagination = payload.get("pagination")
+                if not isinstance(pagination, Mapping):
+                    pagination = payload.get("meta")
+                if isinstance(pagination, Mapping):
+                    total = _bounded_int(pagination.get("total"), 0, 0, 10_000_000)
+                    page_count = _bounded_int(
+                        pagination.get("pages"), 0, 0, 100_000
+                    )
+                    if page_count and page >= page_count:
+                        break
+                    per_page = _bounded_int(
+                        pagination.get("per_page") or pagination.get("page_size"),
+                        self.page_size,
+                        1,
+                        1000,
+                    )
+                else:
+                    per_page = self.page_size
+                if total is not None and page * per_page >= total:
+                    break
+            return fetched
+
+        nodes = fetch_pages(use_source_query=bool(filters.filter_source))
+        # A few deployments accept the parameter syntactically but return an
+        # empty page instead of applying it. Retry without it in that case.
+        if filters.filter_source and not nodes:
+            nodes = fetch_pages(use_source_query=False)
 
         self._write_cache(filters, nodes)
         return nodes
 
     def fetch_source_names(self) -> list[str]:
         payload = self._get_json(PUBLICVPNLIST_SOURCES_URL)
-        raw_sources = payload.get("items", payload.get("sources", payload.get("data", [])))
-        if not isinstance(raw_sources, list):
-            raise SourceError("PublicVPNList sources response is missing an array")
+        raw_sources: Any = None
+        for key in ("items", "sources", "providers", "channels", "data"):
+            candidate = payload.get(key)
+            if isinstance(candidate, (list, dict)):
+                raw_sources = candidate
+                break
+        if raw_sources is None:
+            raise SourceError("PublicVPNList sources response is missing a sources collection")
+        if isinstance(raw_sources, Mapping):
+            normalized_sources: list[Any] = []
+            for key, value in raw_sources.items():
+                if isinstance(value, Mapping):
+                    entry = dict(value)
+                    if not _first(entry, "name", "source", "label", "provider", "provider_name", "channel"):
+                        entry["name"] = key
+                    normalized_sources.append(entry)
+                elif isinstance(value, str):
+                    normalized_sources.append(value)
+                else:
+                    normalized_sources.append(str(key))
+            raw_sources = normalized_sources
         names: set[str] = set()
         for item in raw_sources:
             if isinstance(item, str):
                 name = _clean_text(item, 80)
             elif isinstance(item, Mapping):
-                name = _clean_text(_first(item, "name", "source", "label"), 80)
+                name = _clean_text(
+                    _first(item, "name", "source", "label", "provider", "provider_name", "channel"),
+                    80,
+                )
             else:
                 name = ""
             if name and re.fullmatch(r"[A-Za-z0-9 ._()/+\-]{1,80}", name):
                 names.add(name)
         return sorted(names, key=str.casefold)
 
-    def download_openvpn_config(self, legacy_id: int) -> str:
-        if legacy_id <= 0:
-            raise SourceError("PublicVPNList node has an invalid legacy_id")
-        body = urllib.parse.urlencode({"id": legacy_id}).encode("ascii")
+    def download_openvpn_config(self, node_or_id: Mapping[str, Any] | int | str) -> str:
+        direct_url = ""
+        source_id = ""
+        legacy_id = 0
+        if isinstance(node_or_id, Mapping):
+            direct_url = _clean_text(node_or_id.get("config_download_url"), 2048)
+            source_id = _clean_text(node_or_id.get("source_id") or node_or_id.get("id"), 255)
+            legacy_id = _bounded_int(node_or_id.get("legacy_id"), 0, 0, 2_147_483_647)
+        else:
+            try:
+                legacy_id = int(node_or_id)
+            except (TypeError, ValueError):
+                source_id = _clean_text(node_or_id, 255)
+        if direct_url:
+            self._validate_url(direct_url)
+            config_request = urllib.request.Request(direct_url, headers={"Accept": "application/x-openvpn-profile,text/plain,*/*", "User-Agent": "AimiliVPN/3.0"})
+            config = self._request(config_request).decode("utf-8", errors="replace")
+            validate_openvpn_profile(config)
+            return config
+        token_id: int | str = legacy_id if legacy_id > 0 else source_id
+        if token_id in (0, ""):
+            raise SourceError("PublicVPNList node has no usable configuration identifier")
+        body = urllib.parse.urlencode({"id": token_id}).encode("utf-8")
         token_request = urllib.request.Request(
             PUBLICVPNLIST_TOKEN_URL,
             data=body,

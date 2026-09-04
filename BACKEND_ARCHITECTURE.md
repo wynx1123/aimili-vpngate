@@ -60,6 +60,11 @@ candidate job completes, then refreshes node metadata.
 
 Existing APIs remain available for the current frontend.
 
+Manual measurement only updates endpoint latency. Full OpenVPN availability
+tests are reserved for background maintenance and are limited by
+`OPENVPN_TEST_WORKERS` so that TUN creation, CPU usage, and route changes do
+not overload a small VPS.
+
 ## Environment Variables
 
 ```text
@@ -69,6 +74,7 @@ PUBLICVPNLIST_MAX_PAGES=20
 PUBLICVPNLIST_METADATA_TTL=900
 BACKGROUND_TEST_NODE_LIMIT=15
 LATENCY_PROBE_WORKERS=10
+OPENVPN_TEST_WORKERS=2
 TUNNEL_DRAIN_SECONDS=45
 TUNNEL_DRAIN_MAX_SECONDS=180
 CONFIG_CLEANUP_INITIAL_DELAY_SECONDS=60
@@ -99,3 +105,10 @@ validate these Linux-specific operations on a staging VPS:
 - `curl --interface tunX` candidate health checks;
 - old HTTP/SOCKS5 connections remaining alive during drain;
 - rapid consecutive switches while an old slot is still draining.
+
+OpenVPN profiles containing `redirect-gateway` must not replace the VPS
+default route when the manager starts a candidate tunnel. After rollout,
+verify that SSH remains reachable during connect, switch, background
+maintenance, and candidate failure. Record `ip rule`, `ip route`,
+`ip -details link show tun0`, `ip -details link show tun1`, and the relevant
+systemd journal entries if instability persists.

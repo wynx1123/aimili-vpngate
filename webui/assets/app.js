@@ -226,20 +226,21 @@ async function loadOptions() {
   populateSourceOptions();
 }
 
-async function measureNodes(ids, title = "延迟测量") {
+async function measureNodes(ids, title = "节点检测") {
   const targets = [...new Set(ids)].filter(Boolean).slice(0, 100);
   if (!targets.length) return toast("当前没有可测量的节点");
   targets.forEach((id) => store.measuring.add(id)); render();
   try {
     const payload = await api("v2/latency", { method: "POST", body: { ids: targets } }, 30000);
-    const byId = new Map((payload.results || []).map((item) => [item.id, item]));
+    const results = payload.results || [];
+    const byId = new Map(results.map((item) => [item.id, item]));
     store.nodes = store.nodes.map((node) => {
       const result = byId.get(node.id);
-      return result ? normalizeNode({ ...node, latency_ms: result.latency_ms }) : node;
+      return result ? normalizeNode({ ...node, ...result }) : node;
     });
-    const successful = (payload.results || []).filter((item) => Number(item.latency_ms) > 0).length;
-    toast(`完成 ${targets.length} 个节点测量，${successful} 个返回有效延迟`, title);
-  } catch (error) { toast(error.message, "延迟测量失败", "error"); }
+    const successful = results.filter((item) => Number(item.latency_ms) > 0).length;
+    toast(`完成 ${targets.length} 个节点延迟探测，${successful} 个返回有效延迟`, title);
+  } catch (error) { toast(error.message, "延迟探测失败", "error"); }
   finally { targets.forEach((id) => store.measuring.delete(id)); render(); }
 }
 
